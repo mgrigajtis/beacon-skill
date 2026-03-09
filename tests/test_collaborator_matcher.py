@@ -209,3 +209,25 @@ def test_trust_review_registry_lists_reviewed_agents(client):
     entries = {entry["agent_id"]: entry for entry in body["entries"]}
     assert entries["bcn_alpha"]["review_status"] == "needs_review"
     assert entries["bcn_beta"]["review_status"] == "blocked"
+
+
+def test_agent_json_includes_trust_snapshot(client):
+    _insert_relay_agent(
+        "bcn_json_trust",
+        name="JSON Trust Agent",
+        capabilities=["research"],
+        metadata={"offers": ["docs"]},
+    )
+    mgr = TrustManager(data_dir=beacon_chat.TRUST_DATA_DIR)
+    mgr.hold("bcn_json_trust", reason="needs review", reviewer_note="coach first")
+    mgr.record("bcn_json_trust", "in", "message", outcome="ok")
+
+    resp = client.get("/beacon/agent/bcn_json_trust.json")
+
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["agent_id"] == "bcn_json_trust"
+    assert body["review_status"] == "needs_review"
+    assert body["review_reason"] == "needs review"
+    assert body["can_interact"] is False
+    assert body["interaction_total"] == 1

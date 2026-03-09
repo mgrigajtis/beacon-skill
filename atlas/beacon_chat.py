@@ -1659,6 +1659,29 @@ def get_trust_manager():
     return TrustManager(data_dir=TRUST_DATA_DIR)
 
 
+def trust_snapshot(agent_id):
+    """Small reusable trust snapshot for JSON profile surfaces and review APIs."""
+    mgr = get_trust_manager()
+    review_entries = mgr.review_list()
+    entry = review_entries.get(agent_id, {})
+    score = mgr.score(agent_id)
+    can_interact, gate_reason = mgr.can_interact(agent_id)
+    return {
+        "review_status": entry.get("status", "ok"),
+        "review_reason": entry.get("reason", ""),
+        "reviewer_note": entry.get("reviewer_note", ""),
+        "created_at": int(entry.get("created_at") or 0),
+        "reviewed_at": int(entry.get("reviewed_at") or 0),
+        "can_interact": bool(can_interact),
+        "gate_reason": gate_reason,
+        "trust_score": score["score"],
+        "interaction_total": score["total"],
+        "positive_interactions": score["positive"],
+        "negative_interactions": score["negative"],
+        "rtc_volume": score["rtc_volume"],
+    }
+
+
 # == Identity Management (Key Rotation/Revocation) ==
 
 @app.route("/relay/identity/rotate", methods=["POST", "OPTIONS"])
@@ -1898,25 +1921,9 @@ def api_trust_review_registry():
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
         return resp, 204
 
-    mgr = get_trust_manager()
-    review_entries = mgr.review_list()
     items = []
-    for reviewed_agent_id in sorted(review_entries.keys()):
-        entry = review_entries[reviewed_agent_id]
-        score = mgr.score(reviewed_agent_id)
-        can_interact, gate_reason = mgr.can_interact(reviewed_agent_id)
-        items.append({
-            "agent_id": reviewed_agent_id,
-            "review_status": entry.get("status", "ok"),
-            "review_reason": entry.get("reason", ""),
-            "reviewer_note": entry.get("reviewer_note", ""),
-            "created_at": int(entry.get("created_at") or 0),
-            "reviewed_at": int(entry.get("reviewed_at") or 0),
-            "can_interact": bool(can_interact),
-            "gate_reason": gate_reason,
-            "trust_score": score["score"],
-            "interaction_total": score["total"],
-        })
+    for reviewed_agent_id in sorted(get_trust_manager().review_list().keys()):
+        items.append({"agent_id": reviewed_agent_id, **trust_snapshot(reviewed_agent_id)})
     return cors_json({"ok": True, "count": len(items), "entries": items})
 
 
@@ -1937,29 +1944,13 @@ def api_trust_review(agent_id):
         (resolved_agent_id,),
     ).fetchone() is not None
 
-    mgr = get_trust_manager()
-    review_entries = mgr.review_list()
-    entry = review_entries.get(resolved_agent_id, {})
-    score = mgr.score(resolved_agent_id)
-    can_interact, gate_reason = mgr.can_interact(resolved_agent_id)
     return cors_json({
         "ok": True,
         "requested_agent_id": agent_id,
         "agent_id": resolved_agent_id,
         "resolved": resolved,
         "known_agent": known_agent,
-        "review_status": entry.get("status", "ok"),
-        "review_reason": entry.get("reason", ""),
-        "reviewer_note": entry.get("reviewer_note", ""),
-        "created_at": int(entry.get("created_at") or 0),
-        "reviewed_at": int(entry.get("reviewed_at") or 0),
-        "can_interact": bool(can_interact),
-        "gate_reason": gate_reason,
-        "trust_score": score["score"],
-        "interaction_total": score["total"],
-        "positive_interactions": score["positive"],
-        "negative_interactions": score["negative"],
-        "rtc_volume": score["rtc_volume"],
+        **trust_snapshot(resolved_agent_id),
     })
 
 
@@ -3239,10 +3230,12 @@ def seo_agent_json(agent_id):
                 "profile_url": f"https://rustchain.org/beacon/agent/{agent_id}",
                 "trust_network": "Beacon Atlas",
                 "dofollow_link": f'<a href="https://rustchain.org/beacon/agent/{agent_id}">{persona["name"]}</a>',
+                **trust_snapshot(agent_id),
             })
         return cors_json({"error": "Not found"}, 404)
 
     caps = json.loads(row["capabilities"] or "[]")
+    trust = trust_snapshot(row["agent_id"])
     return cors_json({
         "agent_id": row["agent_id"],
         "name": row["name"],
@@ -3256,6 +3249,7 @@ def seo_agent_json(agent_id):
         "directory_url": "https://rustchain.org/beacon/directory",
         "trust_network": "Beacon Atlas",
         "dofollow_link": f'<a href="https://rustchain.org/beacon/agent/{row["agent_id"]}">{row["name"]}</a>',
+        **trust,
     })
 
 
