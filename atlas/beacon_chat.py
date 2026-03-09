@@ -18,6 +18,7 @@ import sqlite3
 from collections import OrderedDict
 import requests as http_requests
 from flask import Flask, request, jsonify, g
+from beacon_skill.trust import TrustManager
 
 # Optional Ed25519 verification — relay still works without it
 try:
@@ -31,6 +32,7 @@ app = Flask(__name__)
 
 # --- SQLite ---
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "beacon_atlas.db")
+TRUST_DATA_DIR = None
 
 VALID_CONTRACT_TYPES = {"rent", "buy", "lease_to_own", "bounty"}
 VALID_CONTRACT_STATES = {"active", "renewed", "offered", "listed", "expired", "breached"}
@@ -1652,6 +1654,11 @@ def cors_json(data, status=200):
     return resp, status
 
 
+def get_trust_manager():
+    """Shared trust manager used by API, CLI, and local operator tooling."""
+    return TrustManager(data_dir=TRUST_DATA_DIR)
+
+
 # == Identity Management (Key Rotation/Revocation) ==
 
 @app.route("/relay/identity/rotate", methods=["POST", "OPTIONS"])
@@ -1879,6 +1886,81 @@ def api_agent_reputation(agent_id):
     db = get_db()
     result = _recalc_reputation(db, agent_id)
     return cors_json(result)
+
+
+@app.route("/api/trust/review", methods=["GET", "OPTIONS"])
+def api_trust_review_registry():
+    """Return the current trust review registry for dashboards and operators."""
+    if request.method == "OPTIONS":
+        resp = jsonify({})
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "GET"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        return resp, 204
+
+    mgr = get_trust_manager()
+    review_entries = mgr.review_list()
+    items = []
+    for reviewed_agent_id in sorted(review_entries.keys()):
+        entry = review_entries[reviewed_agent_id]
+        score = mgr.score(reviewed_agent_id)
+        can_interact, gate_reason = mgr.can_interact(reviewed_agent_id)
+        items.append({
+            "agent_id": reviewed_agent_id,
+            "review_status": entry.get("status", "ok"),
+            "review_reason": entry.get("reason", ""),
+            "reviewer_note": entry.get("reviewer_note", ""),
+            "created_at": int(entry.get("created_at") or 0),
+            "reviewed_at": int(entry.get("reviewed_at") or 0),
+            "can_interact": bool(can_interact),
+            "gate_reason": gate_reason,
+            "trust_score": score["score"],
+            "interaction_total": score["total"],
+        })
+    return cors_json({"ok": True, "count": len(items), "entries": items})
+
+
+@app.route("/api/trust/review/<agent_id>", methods=["GET", "OPTIONS"])
+def api_trust_review(agent_id):
+    """Return trust review and interaction status for a single agent."""
+    if request.method == "OPTIONS":
+        resp = jsonify({})
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "GET"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        return resp, 204
+
+    resolved_agent_id, resolved = dns_resolve(agent_id)
+    db = get_db()
+    known_agent = db.execute(
+        "SELECT 1 FROM relay_agents WHERE agent_id = ? LIMIT 1",
+        (resolved_agent_id,),
+    ).fetchone() is not None
+
+    mgr = get_trust_manager()
+    review_entries = mgr.review_list()
+    entry = review_entries.get(resolved_agent_id, {})
+    score = mgr.score(resolved_agent_id)
+    can_interact, gate_reason = mgr.can_interact(resolved_agent_id)
+    return cors_json({
+        "ok": True,
+        "requested_agent_id": agent_id,
+        "agent_id": resolved_agent_id,
+        "resolved": resolved,
+        "known_agent": known_agent,
+        "review_status": entry.get("status", "ok"),
+        "review_reason": entry.get("reason", ""),
+        "reviewer_note": entry.get("reviewer_note", ""),
+        "created_at": int(entry.get("created_at") or 0),
+        "reviewed_at": int(entry.get("reviewed_at") or 0),
+        "can_interact": bool(can_interact),
+        "gate_reason": gate_reason,
+        "trust_score": score["score"],
+        "interaction_total": score["total"],
+        "positive_interactions": score["positive"],
+        "negative_interactions": score["negative"],
+        "rtc_volume": score["rtc_volume"],
+    })
 
 
 def _reputation_snapshot(db, agent_id):

@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 
 import pytest
+from beacon_skill.trust import TrustManager
 
 
 ATLAS_DIR = Path(__file__).resolve().parents[1] / "atlas"
@@ -17,7 +18,9 @@ import beacon_chat
 @pytest.fixture()
 def client(monkeypatch, tmp_path):
     db_path = tmp_path / "beacon_matcher.db"
+    trust_dir = tmp_path / "trust"
     monkeypatch.setattr(beacon_chat, "DB_PATH", str(db_path), raising=False)
+    monkeypatch.setattr(beacon_chat, "TRUST_DATA_DIR", trust_dir, raising=False)
     beacon_chat.ATLAS_RATE_LIMITER._entries.clear()
     beacon_chat.ATLAS_RATE_LIMITER._last_cleanup = 0
     beacon_chat.init_db()
@@ -174,3 +177,35 @@ def test_agent_profile_page_renders_match_section(client):
     html = resp.get_data(as_text=True)
     assert "Recommended Collaborators" in html
     assert "Profile Match" in html
+
+
+def test_trust_review_endpoint_reports_hold_status(client):
+    mgr = TrustManager(data_dir=beacon_chat.TRUST_DATA_DIR)
+    mgr.hold("bcn_trust_hold", reason="needs coaching", reviewer_note="slow down spammy outreach")
+    mgr.record("bcn_trust_hold", "in", "message", outcome="spam")
+
+    resp = client.get("/api/trust/review/bcn_trust_hold")
+
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["agent_id"] == "bcn_trust_hold"
+    assert body["review_status"] == "needs_review"
+    assert body["review_reason"] == "needs coaching"
+    assert body["can_interact"] is False
+    assert body["gate_reason"] == "needs_review"
+    assert body["interaction_total"] == 1
+
+
+def test_trust_review_registry_lists_reviewed_agents(client):
+    mgr = TrustManager(data_dir=beacon_chat.TRUST_DATA_DIR)
+    mgr.hold("bcn_alpha", reason="coach first")
+    mgr.escalate("bcn_beta", reason="blocked for abuse", reviewer_note="manual escalation")
+
+    resp = client.get("/api/trust/review")
+
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["ok"] is True
+    entries = {entry["agent_id"]: entry for entry in body["entries"]}
+    assert entries["bcn_alpha"]["review_status"] == "needs_review"
+    assert entries["bcn_beta"]["review_status"] == "blocked"
