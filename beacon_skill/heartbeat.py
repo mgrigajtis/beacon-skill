@@ -75,6 +75,8 @@ class HeartbeatManager:
         status: str = "alive",
         health: Optional[Dict[str, Any]] = None,
         config: Optional[Dict] = None,
+        seo_url: str = "",
+        seo_description: str = "",
     ) -> Dict[str, Any]:
         """Build a heartbeat envelope payload.
 
@@ -83,6 +85,8 @@ class HeartbeatManager:
             status: One of "alive", "degraded", "shutting_down".
             health: Optional health metrics dict (cpu, memory, disk, etc).
             config: Optional config for agent name and start time.
+            seo_url: Agent's homepage URL for dofollow backlink generation.
+            seo_description: Agent description for SEO meta tags.
         """
         cfg = config or self._config
         now = int(time.time())
@@ -103,6 +107,12 @@ class HeartbeatManager:
 
         if health:
             payload["health"] = health
+
+        # SEO dofollow metadata — enables backlink generation on relay
+        if seo_url:
+            payload["seo_url"] = seo_url
+        if seo_description:
+            payload["seo_description"] = seo_description
 
         # Record our own heartbeat
         state["own"] = {

@@ -62,6 +62,8 @@ class RelayAgent:
         self.status: str = data.get("status", "active")
         self.name: str = data.get("name", "")
         self.metadata: Dict[str, Any] = data.get("metadata", {})
+        self.seo_url: str = data.get("seo_url", "")
+        self.seo_description: str = data.get("seo_description", "")
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -79,6 +81,8 @@ class RelayAgent:
             "status": self.status,
             "name": self.name,
             "metadata": self.metadata,
+            "seo_url": self.seo_url,
+            "seo_description": self.seo_description,
         }
 
     def to_public_dict(self) -> Dict[str, Any]:
@@ -309,13 +313,20 @@ class RelayManager:
             "beat_count": agent_data["beat_count"],
         })
 
+        agent_obj = RelayAgent(agent_data)
+        profile_url = f"https://rustchain.org/beacon/agent/{agent_id}"
         return {
             "ok": True,
             "agent_id": agent_id,
             "beat_count": agent_data["beat_count"],
             "status": status,
             "token_expires": agent_data["token_expires"],
-            "assessment": RelayAgent(agent_data).assess_status(),
+            "assessment": agent_obj.assess_status(),
+            "seo": {
+                "profile_url": profile_url,
+                "dofollow": True,
+                "directory_url": "https://rustchain.org/beacon/directory",
+            },
         }
 
     # ── Discovery ──
@@ -345,7 +356,9 @@ class RelayManager:
             if capability and capability not in data.get("capabilities", []):
                 continue
 
-            results.append(agent.to_public_dict())
+            pub = agent.to_public_dict()
+            pub["profile_url"] = f"https://rustchain.org/beacon/agent/{agent.agent_id}"
+            results.append(pub)
 
         results.sort(key=lambda a: a.get("last_heartbeat", 0), reverse=True)
         return results
