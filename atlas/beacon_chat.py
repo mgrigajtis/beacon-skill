@@ -1939,26 +1939,8 @@ def _score_collaborator(source, candidate, rep_score):
     return round(min(score, 0.99) * 100, 1), reasons
 
 
-@app.route("/api/matches/<agent_id>", methods=["GET", "OPTIONS"])
-def api_matches(agent_id):
-    """Recommend likely collaborators for a relay agent."""
-    if request.method == "OPTIONS":
-        resp = jsonify({})
-        resp.headers["Access-Control-Allow-Origin"] = "*"
-        resp.headers["Access-Control-Allow-Methods"] = "GET"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
-        return resp, 204
-
-    resolved_agent_id, resolved = dns_resolve(agent_id)
-    include_dead = request.args.get("include_dead", "false").lower() == "true"
-    limit = min(50, max(1, request.args.get("limit", 10, type=int)))
-
-    db = get_db()
-    source_row = db.execute("SELECT * FROM relay_agents WHERE agent_id = ?", (resolved_agent_id,)).fetchone()
-    if not source_row:
-        return cors_json({"error": "Agent not found"}, 404)
-
-    source = _relay_profile_from_row(source_row)
+def _find_collaborator_matches(db, source, *, include_dead=False, limit=10):
+    """Return collaborator matches for a normalized source profile."""
     rows = db.execute("SELECT * FROM relay_agents ORDER BY last_heartbeat DESC").fetchall()
     matches = []
     for row in rows:
@@ -1997,6 +1979,30 @@ def api_matches(agent_id):
         })
 
     matches.sort(key=lambda item: (-item["score"], -item["last_heartbeat"], item["agent_id"]))
+    return matches[:limit]
+
+
+@app.route("/api/matches/<agent_id>", methods=["GET", "OPTIONS"])
+def api_matches(agent_id):
+    """Recommend likely collaborators for a relay agent."""
+    if request.method == "OPTIONS":
+        resp = jsonify({})
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "GET"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        return resp, 204
+
+    resolved_agent_id, resolved = dns_resolve(agent_id)
+    include_dead = request.args.get("include_dead", "false").lower() == "true"
+    limit = min(50, max(1, request.args.get("limit", 10, type=int)))
+
+    db = get_db()
+    source_row = db.execute("SELECT * FROM relay_agents WHERE agent_id = ?", (resolved_agent_id,)).fetchone()
+    if not source_row:
+        return cors_json({"error": "Agent not found"}, 404)
+
+    source = _relay_profile_from_row(source_row)
+    matches = _find_collaborator_matches(db, source, include_dead=include_dead, limit=limit)
     return cors_json({
         "ok": True,
         "agent_id": source["agent_id"],
@@ -2555,7 +2561,7 @@ def relay_ping():
 from datetime import datetime, timezone
 
 
-def _agent_profile_html(agent, caps, dns_names):
+def _agent_profile_html(agent, caps, dns_names, profile=None, matches=None):
     """Build a full crawlable HTML profile page for an agent with dofollow links."""
     name = agent["name"] or agent["agent_id"]
     aid = agent["agent_id"]
@@ -2573,6 +2579,15 @@ def _agent_profile_html(agent, caps, dns_names):
     desc = seo_desc or f"{name} is an AI agent on the Beacon Atlas network, powered by {provider}."
     cap_str = ", ".join(caps) if caps else "general"
     canonical = f"https://rustchain.org/beacon/agent/{aid}"
+    profile = profile or {
+        "capabilities": list(caps or []),
+        "offers": [],
+        "needs": [],
+        "topics": [],
+        "curiosities": [],
+        "preferred_city": "",
+    }
+    matches = matches or []
 
     # Schema.org JSON-LD — SoftwareApplication
     jsonld = json.dumps({
@@ -2643,6 +2658,39 @@ def _agent_profile_html(agent, caps, dns_names):
         dns_items = "".join(f"<li>{dn['name']}</li>" for dn in dns_names)
         dns_block = f"<h2>DNS Names</h2><ul>{dns_items}</ul>"
 
+    collab_sections = []
+    for label, values in (
+        ("Offers", profile.get("offers", [])),
+        ("Needs", profile.get("needs", [])),
+        ("Topics", profile.get("topics", [])),
+        ("Curiosities", profile.get("curiosities", [])),
+    ):
+        if values:
+            collab_sections.append(
+                f"<h2>{label}</h2><ul>{''.join(f'<li>{v}</li>' for v in values)}</ul>"
+            )
+    if profile.get("preferred_city"):
+        collab_sections.append(
+            f"<h2>Preferred City</h2><p>{profile['preferred_city']}</p>"
+        )
+    collab_block = "\n".join(collab_sections)
+
+    match_block = ""
+    if matches:
+        match_items = []
+        for match in matches[:4]:
+            match_items.append(
+                "<li>"
+                f"<strong><a href=\"/beacon/agent/{match['agent_id']}\">{match['name']}</a></strong> "
+                f"({match['provider_name']}) — score {match['score']:.1f}"
+                f"<br><span class=\"meta\">{' · '.join(match['reasons'][:3])}</span>"
+                "</li>"
+            )
+        match_block = (
+            "<h2>Recommended Collaborators</h2>"
+            "<ul>" + "".join(match_items) + "</ul>"
+        )
+
     links_html = "\n".join(f"<li>{lk}</li>" for lk in dofollow_links)
 
     return f"""<!DOCTYPE html>
@@ -2685,6 +2733,8 @@ ul {{ list-style: none; padding: 0; }} li {{ padding: 4px 0; }}
 <p>{desc}</p>
 <h2>Capabilities</h2>
 <ul>{"".join(f"<li>{c}</li>" for c in (caps or ["general"]))}</ul>
+{collab_block}
+{match_block}
 {dns_block}
 <h2>Agent Details</h2>
 <table>
@@ -2734,7 +2784,15 @@ def seo_agent_profile(agent_id):
         }
         caps = ["inference", "chat", "beacon"]
         dns_names = dns_reverse(agent_id)
-        html = _agent_profile_html(agent, caps, dns_names)
+        native_profile = {
+            "capabilities": caps,
+            "offers": [],
+            "needs": [],
+            "topics": [],
+            "curiosities": [],
+            "preferred_city": "",
+        }
+        html = _agent_profile_html(agent, caps, dns_names, profile=native_profile, matches=[])
         resp = app.response_class(html, mimetype="text/html")
         resp.headers["Cache-Control"] = "public, max-age=3600"
         return resp
@@ -2748,7 +2806,9 @@ def seo_agent_profile(agent_id):
     agent = dict(row)
     caps = json.loads(row["capabilities"] or "[]")
     dns_names = dns_reverse(agent_id)
-    html = _agent_profile_html(agent, caps, dns_names)
+    profile = _relay_profile_from_row(row)
+    matches = _find_collaborator_matches(db, profile, limit=4)
+    html = _agent_profile_html(agent, caps, dns_names, profile=profile, matches=matches)
     resp = app.response_class(html, mimetype="text/html")
     resp.headers["Cache-Control"] = "public, max-age=3600"
     return resp

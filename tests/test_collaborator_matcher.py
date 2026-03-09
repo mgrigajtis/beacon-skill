@@ -139,3 +139,38 @@ def test_matcher_ranks_best_offer_need_pair_first(client):
     assert body["matches"][0]["agent_id"] == "bcn_best"
     assert any("offers what you need" in reason for reason in body["matches"][0]["reasons"])
     assert any("needs what you offer" in reason for reason in body["matches"][0]["reasons"])
+
+
+def test_agent_profile_page_renders_match_section(client):
+    now = time.time()
+    _insert_relay_agent(
+        "bcn_profile_source",
+        name="Profile Source",
+        capabilities=["research", "creative"],
+        metadata={
+            "offers": ["editing"],
+            "needs": ["research"],
+            "topics": ["retro"],
+            "preferred_city": "New Orleans",
+        },
+        last_heartbeat=now,
+    )
+    _insert_relay_agent(
+        "bcn_profile_best",
+        name="Profile Match",
+        capabilities=["research"],
+        metadata={
+            "offers": ["research"],
+            "needs": ["editing"],
+            "topics": ["retro"],
+            "preferred_city": "New Orleans",
+        },
+        provider="anthropic",
+        last_heartbeat=now,
+    )
+
+    resp = client.get("/beacon/agent/bcn_profile_source")
+    assert resp.status_code == 200
+    html = resp.get_data(as_text=True)
+    assert "Recommended Collaborators" in html
+    assert "Profile Match" in html
