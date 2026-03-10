@@ -36,6 +36,27 @@ class RelayClient:
             headers["Authorization"] = f"Bearer {token}"
         return headers
 
+    @staticmethod
+    def build_seo_signature_payload(
+        agent_id: str,
+        seo_url: str,
+        seo_description: str,
+        ts_value: int,
+        nonce: str,
+    ) -> bytes:
+        """Canonical payload for signed SEO field updates."""
+        return json.dumps(
+            {
+                "agent_id": agent_id,
+                "nonce": nonce,
+                "seo_description": seo_description,
+                "seo_url": seo_url,
+                "ts": int(ts_value),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
     def register(
         self,
         identity: AgentIdentity,
@@ -110,6 +131,53 @@ class RelayClient:
 
         resp = requests.post(
             self._url("/relay/heartbeat"),
+            json=body,
+            headers=self._headers(token),
+            timeout=self.timeout_s,
+        )
+        return resp.json()
+
+    def heartbeat_seo(
+        self,
+        identity: AgentIdentity,
+        token: str,
+        *,
+        status: str = "alive",
+        health: Optional[Dict[str, Any]] = None,
+        seo_url: Optional[str] = None,
+        seo_description: Optional[str] = None,
+        nonce: Optional[str] = None,
+        ts_value: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Send a relay heartbeat that can safely update public SEO fields."""
+        body: Dict[str, Any] = {
+            "agent_id": identity.agent_id,
+            "status": status,
+        }
+        if health:
+            body["health"] = health
+        if seo_url is not None:
+            body["seo_url"] = seo_url
+        if seo_description is not None:
+            body["seo_description"] = seo_description
+
+        if seo_url is not None or seo_description is not None:
+            ts_value = int(time.time()) if ts_value is None else int(ts_value)
+            nonce = nonce or f"seo-{int(time.time() * 1000)}"
+            body["ts"] = ts_value
+            body["nonce"] = nonce
+            body["signature"] = identity.sign_hex(
+                self.build_seo_signature_payload(
+                    identity.agent_id,
+                    body.get("seo_url", "") or "",
+                    body.get("seo_description", "") or "",
+                    ts_value,
+                    nonce,
+                )
+            )
+
+        resp = requests.post(
+            self._url("/relay/heartbeat/seo"),
             json=body,
             headers=self._headers(token),
             timeout=self.timeout_s,

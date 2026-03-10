@@ -16,6 +16,7 @@ import re
 import uuid
 import sqlite3
 from collections import OrderedDict
+from urllib.parse import urlparse
 import requests as http_requests
 from flask import Flask, request, jsonify, g
 from beacon_skill.trust import TrustManager
@@ -52,6 +53,8 @@ RELAY_REGISTER_COOLDOWN_S = 10      # Rate limit registration
 RELAY_HEARTBEAT_COOLDOWN_S = 60     # Min seconds between heartbeats per agent
 RELAY_PING_NONCE_WINDOW_S = 300     # Max clock skew + replay window
 RELAY_PING_NONCE_MAX_LEN = 128      # Bound nonce payload size
+RELAY_SEO_DESCRIPTION_MAX_LEN = 500
+RELAY_SEO_URL_MAX_LEN = 512
 
 KNOWN_PROVIDERS = {
     "xai": "xAI (Grok)",
@@ -213,8 +216,8 @@ def assess_relay_status(last_heartbeat_ts):
     return "presumed_dead"
 
 
-def parse_relay_ping_nonce(data, now):
-    """Validate and normalize nonce/timestamp fields for /relay/ping."""
+def _parse_nonce_fields(data, now, *, route_name):
+    """Validate and normalize nonce/timestamp fields for signed relay writes."""
     nonce_raw = data.get("nonce", "")
     if isinstance(nonce_raw, (int, float)):
         nonce_raw = str(nonce_raw)
@@ -225,7 +228,7 @@ def parse_relay_ping_nonce(data, now):
     if not nonce:
         return None, None, cors_json({
             "error": "nonce required",
-            "hint": "Include a unique nonce per /relay/ping request",
+            "hint": f"Include a unique nonce per {route_name} request",
         }, 400)
     if len(nonce) > RELAY_PING_NONCE_MAX_LEN:
         return None, None, cors_json({
@@ -253,20 +256,91 @@ def parse_relay_ping_nonce(data, now):
     return nonce, ts_value, None
 
 
-def reserve_relay_ping_nonce(db, agent_id, nonce, ts_value, now):
+def parse_relay_ping_nonce(data, now):
+    """Validate and normalize nonce/timestamp fields for /relay/ping."""
+    return _parse_nonce_fields(data, now, route_name="/relay/ping")
+
+
+def parse_relay_seo_nonce(data, now):
+    """Validate and normalize nonce/timestamp fields for signed SEO updates."""
+    return _parse_nonce_fields(data, now, route_name="/relay/heartbeat/seo")
+
+
+def _reserve_nonce(db, table_name, agent_id, nonce, ts_value, now):
     """Reserve nonce for replay window. Returns False if nonce already seen."""
     db.execute(
-        "DELETE FROM relay_ping_nonces WHERE created_at < ?",
+        f"DELETE FROM {table_name} WHERE created_at < ?",
         (now - RELAY_PING_NONCE_WINDOW_S,),
     )
     try:
         db.execute(
-            "INSERT INTO relay_ping_nonces (agent_id, nonce, ts, created_at) VALUES (?, ?, ?, ?)",
+            f"INSERT INTO {table_name} (agent_id, nonce, ts, created_at) VALUES (?, ?, ?, ?)",
             (agent_id, nonce, ts_value, now),
         )
     except sqlite3.IntegrityError:
         return False
     return True
+
+
+def reserve_relay_ping_nonce(db, agent_id, nonce, ts_value, now):
+    return _reserve_nonce(db, "relay_ping_nonces", agent_id, nonce, ts_value, now)
+
+
+def reserve_relay_seo_nonce(db, agent_id, nonce, ts_value, now):
+    return _reserve_nonce(db, "relay_seo_update_nonces", agent_id, nonce, ts_value, now)
+
+
+def build_relay_seo_signature_payload(agent_id, seo_url, seo_description, ts_value, nonce):
+    """Canonical signed payload for SEO field changes."""
+    return json.dumps(
+        {
+            "agent_id": agent_id,
+            "nonce": nonce,
+            "seo_description": seo_description,
+            "seo_url": seo_url,
+            "ts": int(ts_value),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def record_relay_seo_history(
+    db,
+    *,
+    agent_id,
+    now,
+    changed_fields,
+    before_state,
+    after_state,
+    signature_hex,
+    pubkey_hex,
+    nonce,
+    origin_ip,
+    update_path="/relay/heartbeat/seo",
+    auth_method="relay_token+ed25519",
+):
+    db.execute(
+        """
+        INSERT INTO relay_seo_history (
+            agent_id, ts, update_path, auth_method, changed_fields,
+            before_state, after_state, signature_hex, pubkey_hex, nonce, origin_ip
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            agent_id,
+            now,
+            update_path,
+            auth_method,
+            json.dumps(changed_fields, sort_keys=True),
+            json.dumps(before_state, sort_keys=True),
+            json.dumps(after_state, sort_keys=True),
+            signature_hex,
+            pubkey_hex,
+            nonce,
+            origin_ip,
+        ),
+    )
 
 
 SEED_CONTRACTS = [
@@ -372,6 +446,31 @@ def init_db():
             ts REAL NOT NULL,
             created_at REAL NOT NULL,
             PRIMARY KEY (agent_id, nonce)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS relay_seo_update_nonces (
+            agent_id TEXT NOT NULL,
+            nonce TEXT NOT NULL,
+            ts REAL NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY (agent_id, nonce)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS relay_seo_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_id TEXT NOT NULL,
+            ts REAL NOT NULL,
+            update_path TEXT NOT NULL,
+            auth_method TEXT NOT NULL,
+            changed_fields TEXT NOT NULL,
+            before_state TEXT NOT NULL,
+            after_state TEXT NOT NULL,
+            signature_hex TEXT DEFAULT '',
+            pubkey_hex TEXT DEFAULT '',
+            nonce TEXT DEFAULT '',
+            origin_ip TEXT DEFAULT ''
         )
     """)
     # SEO Dofollow: Add seo_url and seo_description columns if missing
@@ -1484,10 +1583,74 @@ def relay_seo_stats(agent_id):
     if not has_seo_url:
         stats["recommendation"] = (
             "Set seo_url and seo_description in your heartbeat to get a custom "
-            "dofollow backlink. Use POST /relay/heartbeat/seo with your relay token."
+            "dofollow backlink. Changing those public fields now requires "
+            "POST /relay/heartbeat/seo with your relay token, nonce, ts, and "
+            "an Ed25519 signature from the registered agent identity."
         )
 
     return cors_json(stats)
+
+
+@app.route("/relay/seo/history/<agent_id>", methods=["GET", "OPTIONS"])
+def relay_seo_history(agent_id):
+    """Query SEO backlink/profile field change history for a relay agent."""
+    if request.method == "OPTIONS":
+        resp = jsonify({})
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "GET"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Admin-Key"
+        return resp, 204
+
+    try:
+        limit = int(request.args.get("limit", "20"))
+    except ValueError:
+        return cors_json({"error": "limit must be an integer"}, 400)
+    limit = max(1, min(limit, 100))
+
+    admin_key = request.headers.get("X-Admin-Key", "")
+    is_admin = bool(admin_key) and admin_key == os.environ.get("RC_ADMIN_KEY", "")
+
+    db = get_db()
+    exists = db.execute("SELECT 1 FROM relay_agents WHERE agent_id = ?", (agent_id,)).fetchone()
+    rows = db.execute(
+        """
+        SELECT id, ts, update_path, auth_method, changed_fields, before_state, after_state,
+               signature_hex, pubkey_hex, nonce, origin_ip
+        FROM relay_seo_history
+        WHERE agent_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (agent_id, limit),
+    ).fetchall()
+
+    if not exists and not rows:
+        return cors_json({"error": "Agent not found", "hint": "Register at /relay/register"}, 404)
+
+    history = []
+    for row in rows:
+        entry = {
+            "ts": row["ts"],
+            "update_path": row["update_path"],
+            "auth_method": row["auth_method"],
+            "changed_fields": json.loads(row["changed_fields"] or "[]"),
+            "before_state": json.loads(row["before_state"] or "{}"),
+            "after_state": json.loads(row["after_state"] or "{}"),
+            "signature_verified": bool(row["signature_hex"]),
+        }
+        if is_admin:
+            entry["nonce"] = row["nonce"] or ""
+            entry["origin_ip"] = row["origin_ip"] or ""
+            entry["pubkey_hex"] = row["pubkey_hex"] or ""
+            entry["signature_preview"] = (row["signature_hex"] or "")[:16]
+        history.append(entry)
+
+    return cors_json({
+        "agent_id": agent_id,
+        "count": len(history),
+        "visibility": "operator" if is_admin else "public",
+        "history": history,
+    })
 
 
 @app.route("/relay/seo/report", methods=["GET", "OPTIONS"])
@@ -1526,6 +1689,7 @@ def relay_seo_report():
             "llms_txt": "/beacon/llms.txt",
             "agent_profile": "/beacon/agent/{agent_id}",
             "seo_heartbeat": "/relay/heartbeat/seo",
+            "seo_history": "/relay/seo/history/{agent_id}",
             "seo_stats": "/relay/seo/stats/{agent_id}",
         },
         "version": "2.16.0",
@@ -1547,6 +1711,7 @@ def well_known_beacon():
             "register": "/relay/register",
             "heartbeat": "/relay/heartbeat",
             "heartbeat_seo": "/relay/heartbeat/seo",
+            "seo_history": "/relay/seo/history/{agent_id}",
             "discover": "/relay/discover",
             "message": "/relay/message",
             "status": "/relay/status/{agent_id}",
@@ -3145,6 +3310,10 @@ def relay_heartbeat_seo():
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
         return resp, 204
 
+    rl = enforce_rate_limit("relay_heartbeat_seo_write", _write_limit_per_min())
+    if rl:
+        return rl
+
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         return cors_json({"error": "Missing Authorization: Bearer <relay_token>"}, 401)
@@ -3157,22 +3326,52 @@ def relay_heartbeat_seo():
     agent_id = data.get("agent_id", "").strip()
     status_val = data.get("status", "alive").strip()
     health_data = data.get("health", None)
-    seo_url = data.get("seo_url", "").strip()
-    seo_description = data.get("seo_description", "").strip()
+    signature_hex = data.get("signature", "").strip()
+    provided_pubkey_hex = data.get("pubkey_hex", "").strip()
+    seo_url_present = "seo_url" in data
+    seo_description_present = "seo_description" in data
+
+    seo_url_raw = data.get("seo_url", "")
+    if seo_url_raw is None:
+        seo_url_raw = ""
+    if not isinstance(seo_url_raw, str):
+        return cors_json({"error": "seo_url must be a string"}, 400)
+    seo_url = seo_url_raw.strip()
+
+    seo_description_raw = data.get("seo_description", "")
+    if seo_description_raw is None:
+        seo_description_raw = ""
+    if not isinstance(seo_description_raw, str):
+        return cors_json({"error": "seo_description must be a string"}, 400)
+    seo_description = seo_description_raw.strip()
 
     if not agent_id:
         return cors_json({"error": "agent_id required"}, 400)
     if status_val not in ("alive", "degraded", "shutting_down"):
         return cors_json({"error": "status must be: alive, degraded, or shutting_down"}, 400)
 
-    # Validate seo_url if provided
-    if seo_url and not seo_url.startswith(("http://", "https://")):
-        return cors_json({"error": "seo_url must start with http:// or https://"}, 400)
+    if seo_url_present:
+        if len(seo_url) > RELAY_SEO_URL_MAX_LEN:
+            return cors_json({"error": f"seo_url too long (max {RELAY_SEO_URL_MAX_LEN} chars)"}, 400)
+        if seo_url:
+            if not seo_url.startswith(("http://", "https://")):
+                return cors_json({"error": "seo_url must start with http:// or https://"}, 400)
+            parsed = urlparse(seo_url)
+            if not parsed.scheme or not parsed.netloc:
+                return cors_json({"error": "seo_url must be a valid absolute URL"}, 400)
+
+    if seo_description_present and len(seo_description) > RELAY_SEO_DESCRIPTION_MAX_LEN:
+        return cors_json({
+            "error": f"seo_description too long (max {RELAY_SEO_DESCRIPTION_MAX_LEN} chars)"
+        }, 400)
 
     db = get_db()
     row = db.execute("SELECT * FROM relay_agents WHERE agent_id = ?", (agent_id,)).fetchone()
     if not row:
         return cors_json({"error": "Agent not registered — use /relay/register first"}, 404)
+
+    if row["status"] == "revoked":
+        return cors_json({"error": "This agent identity has been revoked"}, 403)
 
     if row["relay_token"] != token:
         return cors_json({"error": "Invalid relay token", "code": "AUTH_FAILED"}, 403)
@@ -3180,6 +3379,87 @@ def relay_heartbeat_seo():
     now = time.time()
     if row["token_expires"] < now:
         return cors_json({"error": "Token expired — re-register", "code": "TOKEN_EXPIRED"}, 401)
+
+    stored_pubkey_hex = (row["pubkey_hex"] or "").strip()
+    if provided_pubkey_hex and provided_pubkey_hex != stored_pubkey_hex:
+        return cors_json({
+            "error": "pubkey_hex does not match registered key for this agent"
+        }, 403)
+
+    current_seo_url = (row["seo_url"] or "").strip()
+    current_seo_description = (row["seo_description"] or "").strip()
+    target_seo_url = seo_url if seo_url_present else current_seo_url
+    target_seo_description = seo_description if seo_description_present else current_seo_description
+
+    changed_fields = []
+    if seo_url_present and target_seo_url != current_seo_url:
+        changed_fields.append("seo_url")
+    if seo_description_present and target_seo_description != current_seo_description:
+        changed_fields.append("seo_description")
+
+    if changed_fields:
+        if not stored_pubkey_hex:
+            return cors_json({
+                "error": "Stored identity key missing",
+                "hint": "Re-register this agent with a valid Ed25519 identity before changing SEO fields",
+            }, 403)
+        if len(stored_pubkey_hex) != 64:
+            return cors_json({
+                "error": "Stored identity key invalid",
+                "hint": "Re-register this agent with a valid Ed25519 identity before changing SEO fields",
+            }, 403)
+        try:
+            bytes.fromhex(stored_pubkey_hex)
+        except ValueError:
+            return cors_json({
+                "error": "Stored identity key invalid",
+                "hint": "Re-register this agent with a valid Ed25519 identity before changing SEO fields",
+            }, 403)
+
+        if agent_id.startswith("bcn_"):
+            expected_agent_id = agent_id_from_pubkey_hex(stored_pubkey_hex)
+            if expected_agent_id != agent_id:
+                return cors_json({
+                    "error": "agent_id does not match registered pubkey identity",
+                    "expected": expected_agent_id,
+                    "hint": "Re-register this agent before changing SEO fields",
+                }, 403)
+
+        if not signature_hex:
+            return cors_json({
+                "error": "signature required when changing seo_url or seo_description",
+                "hint": "Sign the canonical SEO update payload with your registered Ed25519 identity",
+            }, 400)
+
+        nonce, ts_value, nonce_error = parse_relay_seo_nonce(data, now)
+        if nonce_error is not None:
+            return nonce_error
+
+        sig_payload = build_relay_seo_signature_payload(
+            agent_id,
+            target_seo_url,
+            target_seo_description,
+            ts_value,
+            nonce,
+        )
+        sig_ok = verify_ed25519(stored_pubkey_hex, signature_hex, sig_payload)
+        if sig_ok is None:
+            return cors_json({
+                "error": "Signature verification unavailable",
+                "hint": "Server missing Ed25519 verification support",
+            }, 503)
+        if sig_ok is False:
+            return cors_json({
+                "error": "Invalid Ed25519 signature for SEO field update"
+            }, 403)
+        if not reserve_relay_seo_nonce(db, agent_id, nonce, ts_value, now):
+            return cors_json({
+                "error": "nonce replay detected",
+                "hint": "Use a fresh nonce for each /relay/heartbeat/seo request",
+                "window_s": RELAY_PING_NONCE_WINDOW_S,
+            }, 409)
+    else:
+        nonce = ""
 
     new_beat = row["beat_count"] + 1
     new_expires = now + RELAY_TOKEN_TTL_S
@@ -3190,27 +3470,54 @@ def relay_heartbeat_seo():
     meta["last_ip"] = get_real_ip()
     meta = _merge_collab_metadata(meta, data)
 
-    # Update SEO fields
-    seo_updates = ""
+    update_fields = [
+        "last_heartbeat = ?",
+        "beat_count = ?",
+        "status = ?",
+        "token_expires = ?",
+        "metadata = ?",
+    ]
     params = [now, new_beat, status_val, new_expires, json.dumps(meta)]
-    if seo_url:
-        seo_updates += ", seo_url = ?"
-        params.append(seo_url)
-    if seo_description:
-        seo_updates += ", seo_description = ?"
-        params.append(seo_description[:500])
+    if seo_url_present:
+        update_fields.append("seo_url = ?")
+        params.append(target_seo_url)
+    if seo_description_present:
+        update_fields.append("seo_description = ?")
+        params.append(target_seo_description)
     params.append(agent_id)
 
-    db.execute(f"""
-        UPDATE relay_agents SET
-            last_heartbeat = ?, beat_count = ?, status = ?,
-            token_expires = ?, metadata = ?{seo_updates}
-        WHERE agent_id = ?
-    """, params)
-    db.commit()
+    db.execute(
+        f"UPDATE relay_agents SET {', '.join(update_fields)} WHERE agent_id = ?",
+        params,
+    )
+
+    if changed_fields:
+        record_relay_seo_history(
+            db,
+            agent_id=agent_id,
+            now=now,
+            changed_fields=changed_fields,
+            before_state={
+                "seo_url": current_seo_url,
+                "seo_description": current_seo_description,
+            },
+            after_state={
+                "seo_url": target_seo_url,
+                "seo_description": target_seo_description,
+            },
+            signature_hex=signature_hex,
+            pubkey_hex=stored_pubkey_hex,
+            nonce=nonce,
+            origin_ip=get_real_ip(),
+        )
 
     db.execute("INSERT INTO relay_log (ts, action, agent_id, detail) VALUES (?, 'heartbeat_seo', ?, ?)",
-               (now, agent_id, json.dumps({"beat": new_beat, "seo_url": seo_url})))
+               (now, agent_id, json.dumps({
+                   "beat": new_beat,
+                   "seo_url": target_seo_url,
+                   "changed_fields": changed_fields,
+                   "signed_change": bool(changed_fields),
+               })))
     db.commit()
 
     # The dofollow backlink: this URL is the agent's crawlable profile
@@ -3227,9 +3534,12 @@ def relay_heartbeat_seo():
         "seo": {
             "profile_url": profile_url,
             "dofollow": True,
+            "history_url": f"https://rustchain.org/beacon/relay/seo/history/{agent_id}",
             "directory_url": "https://rustchain.org/beacon/directory",
             "sitemap_url": "https://rustchain.org/beacon/sitemap.xml",
             "authority_signal": f"Verified agent on Beacon Atlas (beat #{new_beat})",
+            "changed_fields": changed_fields,
+            "signed_update": bool(changed_fields),
         },
     })
 

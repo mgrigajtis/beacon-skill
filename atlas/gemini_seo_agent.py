@@ -37,6 +37,8 @@ import secrets
 import requests
 from typing import Any, Dict, List, Optional
 
+from beacon_skill.identity import AgentIdentity
+
 # Gemini SDK
 try:
     from google import genai
@@ -134,16 +136,20 @@ def _save_state(state: Dict):
 
 def register_on_relay():
     """Register the Gemini SEO agent on the Beacon relay."""
-    # Generate a deterministic pubkey from agent name (for simplicity)
-    seed = hashlib.sha256(f"gemini-seo-agent-{AGENT_NAME}".encode()).hexdigest()
-    pubkey_hex = seed[:64]
+    identity = AgentIdentity.from_mnemonic(f"gemini-seo-agent-{AGENT_NAME}")
+    reg_payload = json.dumps({
+        "model_id": GEMINI_MODEL,
+        "provider": AGENT_PROVIDER,
+        "pubkey_hex": identity.public_key_hex,
+    }, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
     payload = {
-        "pubkey_hex": pubkey_hex,
+        "pubkey_hex": identity.public_key_hex,
         "model_id": GEMINI_MODEL,
         "provider": AGENT_PROVIDER,
         "capabilities": AGENT_CAPABILITIES,
         "name": AGENT_NAME,
+        "signature": identity.sign_hex(reg_payload),
     }
 
     try:
@@ -172,16 +178,30 @@ def heartbeat():
     state = _load_state()
     token = state.get("relay_token")
     agent_id = state.get("agent_id")
+    identity = AgentIdentity.from_mnemonic(f"gemini-seo-agent-{AGENT_NAME}")
 
     if not token or not agent_id:
         print("Not registered. Run: gemini_seo_agent.py register")
         return
+
+    nonce = f"seo-{int(time.time() * 1000)}"
+    ts_value = int(time.time())
+    sig_payload = json.dumps({
+        "agent_id": agent_id,
+        "nonce": nonce,
+        "seo_description": AGENT_SEO_DESC,
+        "seo_url": AGENT_SEO_URL,
+        "ts": ts_value,
+    }, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
     payload = {
         "agent_id": agent_id,
         "status": "alive",
         "seo_url": AGENT_SEO_URL,
         "seo_description": AGENT_SEO_DESC,
+        "nonce": nonce,
+        "ts": ts_value,
+        "signature": identity.sign_hex(sig_payload),
     }
 
     try:
