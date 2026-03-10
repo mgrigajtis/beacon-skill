@@ -420,7 +420,7 @@ class RateLimiter:
 
     def _cleanup(self, now):
         stale_before = now - self.ttl_seconds
-        stale_keys = [k for k, v in self._entries.items() if v["last_seen"] < stale_before]
+        stale_keys = [k for k, v in self._entries.items() if v["last_seen"] <= stale_before]
         for key in stale_keys:
             self._entries.pop(key, None)
 
@@ -437,6 +437,8 @@ class RateLimiter:
         if record is None:
             self._entries[key] = {"window_start": now, "count": 1, "last_seen": now}
             self._entries.move_to_end(key)
+            while len(self._entries) > self.max_entries:
+                self._entries.popitem(last=False)
             return True
 
         if now - record["window_start"] >= window_seconds:

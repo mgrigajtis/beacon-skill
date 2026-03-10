@@ -58,7 +58,9 @@ class TestKeyRevocationRotation(unittest.TestCase):
             "/relay/ping",
             json={
                 "agent_id": agent_id,
-                "relay_token": "relay_token_" + agent_id
+                "relay_token": "relay_token_" + agent_id,
+                "nonce": f"revoked-{int(time.time() * 1000)}",
+                "ts": time.time(),
             }
         )
         self.assertEqual(response.status_code, 403)
